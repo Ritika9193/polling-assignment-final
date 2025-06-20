@@ -24,7 +24,7 @@ export default function StudentPoll() {
   const [kickedOut, setKickedOut] = useState(false);
 
   useEffect(() => {
-    socket = io("http://localhost:5001");
+    socket = io("https://socket-polling-api.onrender.com");
     const studentName = sessionStorage.getItem('studentName') || '';
     socket.emit("registerStudent", studentName);
     socket.on("newPoll", (pollData: any) => {

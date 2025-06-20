@@ -33,7 +33,7 @@ export default function TeacherPage() {
   const [pollHistory, setPollHistory] = useState<any[]>([]);
 
   useEffect(() => {
-    socket = io("http://localhost:5001");
+    socket = io("https://socket-polling-api.onrender.com");
     socket.on("newPoll", (poll: any) => {
       setActivePoll(poll);
       setShowPollForm(false);
