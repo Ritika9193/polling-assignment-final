@@ -17,22 +17,53 @@ app.use(cors());
 app.use(express.json());
 app.use('/polls', pollsRouter);
 
-let activePoll = null;
+let activePoll = null; // Will store { id, question, options, startTime, duration, isActive, isShowingResults }
 let pollResults = {};
 let studentAnswers = {}; // { pollId: { studentId: true } }
 let connectedStudents = new Map(); // socket.id -> name
 let pollHistory = [];
 let chatHistory = [];
 
+const RESULTS_VIEW_DURATION = 25000; // 20 seconds
+let pollTimerId = null;
+let resultsTimerId = null;
+
+const endPollVoting = (pollId) => {
+  if (activePoll && activePoll.id === pollId && activePoll.isActive) {
+    activePoll.isActive = false;
+    activePoll.isShowingResults = true;
+    
+    const currentPollResultsData = pollResults[pollId] || { votes: Array(activePoll.options.length).fill(0), answers: {} };
+    io.emit('pollVotingClosed', { pollId: pollId, results: currentPollResultsData });
+    
+    const pollForHistory = { ...activePoll, results: currentPollResultsData }; // isActive is already false
+    pollHistory.push(pollForHistory);
+
+    if (pollTimerId) clearTimeout(pollTimerId);
+    if (resultsTimerId) clearTimeout(resultsTimerId);
+
+    resultsTimerId = setTimeout(() => {
+      if (activePoll && activePoll.id === pollId && activePoll.isShowingResults) {
+        activePoll.isShowingResults = false; // Fully concluded
+        io.emit('clearActivePoll');
+        // activePoll remains as the last poll (now fully inactive) until a new one starts
+      }
+    }, RESULTS_VIEW_DURATION);
+  }
+};
+
 io.on('connection', (socket) => {
-  // Student registers with their name
   socket.on('registerStudent', (name) => {
     connectedStudents.set(socket.id, name);
-    // Send the active poll to the newly connected student
-    if (activePoll && activePoll.isActive) {
-      socket.emit('newPoll', activePoll);
+    if (activePoll) {
+      socket.emit('newPoll', activePoll); // Client will check isActive/isShowingResults
+      if (activePoll.isShowingResults || !activePoll.isActive) { // If results are showing or voting is over
+        const currentPollResultsData = pollResults[activePoll.id] || { votes: Array(activePoll.options.length).fill(0), answers: {} };
+        socket.emit('pollVotingClosed', { pollId: activePoll.id, results: currentPollResultsData });
+      }
+    } else {
+      socket.emit('newPoll', null); // No poll has been run yet
     }
-    // Broadcast updated participant list
     io.emit('participants', Array.from(connectedStudents.values()));
   });
 
@@ -56,56 +87,54 @@ io.on('connection', (socket) => {
   // Teacher creates a poll
   socket.on('createPoll', (pollData, callback) => {
     if (activePoll && activePoll.isActive) {
-      callback({ error: 'A poll is already active.' });
-      return;
+      return callback({ error: 'A poll is already active.' });
     }
+
+    if (pollTimerId) clearTimeout(pollTimerId);
+    if (resultsTimerId) clearTimeout(resultsTimerId);
+
     const id = Date.now().toString();
-    activePoll = { ...pollData, id, isActive: true };
+    activePoll = { 
+      ...pollData, 
+      id, 
+      isActive: true, 
+      isShowingResults: false,
+      startTime: Date.now(),
+      duration: pollData.timer
+    };
     pollResults[id] = { votes: Array(pollData.options.length).fill(0), answers: {} };
     studentAnswers[id] = {};
     io.emit('newPoll', activePoll);
     callback({ success: true, poll: activePoll });
 
-    // Auto-close poll after 60 seconds
-    setTimeout(() => {
-      if (activePoll && activePoll.id === id && activePoll.isActive) {
-        activePoll.isActive = false;
-        io.emit('pollClosed', { pollId: id });
-        // Add to poll history
-        pollHistory.push({ ...activePoll, results: pollResults[id] });
-      }
-    }, 60000);
+    pollTimerId = setTimeout(() => {
+      endPollVoting(id);
+    }, activePoll.duration * 1000);
   });
 
   // Student submits an answer
-  socket.on('submitAnswer', ({ pollId, optionIdx, studentId }, callback) => {
+  socket.on('submitAnswer', ({ pollId, optionIdx }, callback) => {
     if (!activePoll || !activePoll.isActive || activePoll.id !== pollId) {
-      callback({ error: 'No active poll.' });
-      return;
+      return callback({ error: 'No active poll or poll is not active for voting.' });
     }
-    if (pollResults[pollId].answers[studentId]) {
-      callback({ error: 'Already answered.' });
-      return;
+    if (pollResults[pollId].answers[socket.id]) {
+      return callback({ error: 'Already answered.' });
     }
+
     pollResults[pollId].votes[optionIdx]++;
-    pollResults[pollId].answers[studentId] = true;
-    studentAnswers[pollId][studentId] = true;
-    io.emit('pollResults', pollResults[pollId]);
-    // If all students have answered, close the poll
+    pollResults[pollId].answers[socket.id] = true;
+    if (!studentAnswers[pollId]) studentAnswers[pollId] = {};
+    studentAnswers[pollId][socket.id] = true;
+    
+    // Emit full results for the current poll as votes come in
+    io.emit('pollResults', pollResults[pollId]); 
+
     if (Object.keys(studentAnswers[pollId]).length >= connectedStudents.size) {
-      activePoll.isActive = false;
-      io.emit('pollClosed', { pollId });
-      // Add to poll history
-      pollHistory.push({ ...activePoll, results: pollResults[pollId] });
+      endPollVoting(pollId); // All connected students voted
     }
     callback({ success: true });
   });
-
-  // Teacher can request results
-  socket.on('getResults', (pollId, callback) => {
-    callback(pollResults[pollId] || {});
-  });
-
+  
   // Teacher requests poll history
   socket.on('getPollHistory', (callback) => {
     callback(pollHistory);
